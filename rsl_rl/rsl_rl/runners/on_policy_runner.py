@@ -41,6 +41,7 @@ import wandb
 import datetime
 
 from rsl_rl.algorithms import PPO
+from rsl_rl.algorithms.codesign_ppo import CoDesignPPO
 from rsl_rl.modules import *
 from rsl_rl.env import VecEnv
 import sys
