@@ -54,42 +54,37 @@ class CoDesignLeggedRobot(LeggedRobot):
     def _parse_cfg(self, cfg):
         super()._parse_cfg(cfg)
 
-        # Parse spatial randomization config
+        # Parse spatial randomization config.
+        # NOTE: self.device is NOT available yet (set later in BaseTask.__init__),
+        # so we store xi_values on CPU and move to device in _init_buffers.
         sr = self.cfg.spatial_rand
         if sr.enable:
             xi_range = sr.xi_range
             num_envs = self.cfg.env.num_envs
-            num_groups = sr.num_groups
+            num_groups = int(sr.num_groups)
 
-            # Each environment gets its own random xi vector
-            # xi shape: (num_envs, 4) for [front_thigh, front_calf, rear_thigh, rear_calf]
             if num_groups >= num_envs:
-                # Every env gets unique parameters
-                self._xi_values = torch.zeros(num_envs, 4, dtype=torch.float, device=self.device)
+                self._xi_values = torch.zeros(num_envs, 4, dtype=torch.float, device='cpu')
                 for i in range(4):
                     self._xi_values[:, i] = torch_rand_float(
-                        xi_range[0], xi_range[1], (num_envs, 1), device=self.device
+                        xi_range[0], xi_range[1], (num_envs, 1), device='cpu'
                     ).squeeze(1)
             else:
-                # Group environments: generate num_groups unique parameter sets,
-                # then repeat each set across group_size environments
                 group_size = num_envs // num_groups
-                xi_unique = torch.zeros(num_groups, 4, dtype=torch.float)
+                xi_unique = torch.zeros(num_groups, 4, dtype=torch.float, device='cpu')
                 for i in range(4):
                     xi_unique[:, i] = torch_rand_float(
                         xi_range[0], xi_range[1], (num_groups, 1), device='cpu'
                     ).squeeze(1)
-                # Repeat to fill all environments
                 repeats = num_envs // num_groups
                 remainder = num_envs % num_groups
                 self._xi_values = torch.cat([
                     xi_unique.repeat_interleave(repeats, dim=0),
                     xi_unique[:remainder]
-                ], dim=0).to(self.device)
+                ], dim=0)  # stays on CPU
         else:
-            # Fixed morphology: all envs use xi = [1, 1, 1, 1]
             self._xi_values = torch.ones(self.cfg.env.num_envs, 4,
-                                         dtype=torch.float, device=self.device)
+                                         dtype=torch.float, device='cpu')
 
     # ------------------------------------------------------------------
     # Environment creation with per-morphology URDF assets
@@ -214,15 +209,18 @@ class CoDesignLeggedRobot(LeggedRobot):
             xi_key = tuple(round(v, 6) for v in xi_list)
             asset = self._xi_to_asset[xi_key]
 
-            # Process shape properties (friction randomization)
+            # Get fresh rigid shape props from THIS asset (cannot deepcopy C++ objects)
+            asset_rigid_shape_props = self.gym.get_asset_rigid_shape_properties(asset)
             rigid_shape_props = self._process_rigid_shape_props(
-                copy.deepcopy(rigid_shape_props_asset), i)
+                asset_rigid_shape_props, i)
             self.gym.set_asset_rigid_shape_properties(asset, rigid_shape_props)
 
             anymal_handle = self.gym.create_actor(env_handle, asset, start_pose,
                                                    "anymal", i,
                                                    self.cfg.asset.self_collisions, 0)
-            dof_props = self._process_dof_props(dof_props_asset, i)
+            # Get DOF props from the actual asset used for this env
+            asset_dof_props = self.gym.get_asset_dof_properties(asset)
+            dof_props = self._process_dof_props(asset_dof_props, i)
             self.gym.set_actor_dof_properties(env_handle, anymal_handle, dof_props)
             body_props = self.gym.get_actor_rigid_body_properties(env_handle, anymal_handle)
             body_props, mass_params = self._process_rigid_body_props(body_props, i)
@@ -281,6 +279,9 @@ class CoDesignLeggedRobot(LeggedRobot):
 
     def _init_buffers(self):
         """Extend base buffer init to compute per-environment PD gains."""
+        # Move xi values to the correct device now that self.device is available
+        self._xi_values = self._xi_values.to(self.device)
+
         super()._init_buffers()
 
         if not hasattr(self, 'p_gains_env') or self.p_gains_env is None:
@@ -360,6 +361,71 @@ class CoDesignLeggedRobot(LeggedRobot):
             raise NameError(f"Unknown controller type: {control_type}")
 
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
+
+    # ------------------------------------------------------------------
+    # Observation with structure parameters (paper Section 1.1.1)
+    # ------------------------------------------------------------------
+
+    def compute_observations(self):
+        """Override to include leg-length scaling factors xi in priv_latent.
+
+        Paper specification:
+          et = [mass(1), COM(3), structure_params(4), friction(1), motor_damping(24)] = 33
+        """
+        imu_obs = torch.stack((self.roll, self.pitch), dim=1)
+        if self.global_counter % 5 == 0:
+            self.delta_yaw = self.target_yaw - self.yaw
+            self.delta_next_yaw = self.next_target_yaw - self.yaw
+        obs_buf = torch.cat((
+            self.base_ang_vel * self.obs_scales.ang_vel,
+            imu_obs,
+            0 * self.delta_yaw[:, None],
+            self.delta_yaw[:, None],
+            self.delta_next_yaw[:, None],
+            0 * self.commands[:, 0:2],
+            self.commands[:, 0:1],
+            (self.env_class != 17).float()[:, None],
+            (self.env_class == 17).float()[:, None],
+            self.reindex((self.dof_pos - self.default_dof_pos_all) * self.obs_scales.dof_pos),
+            self.reindex(self.dof_vel * self.obs_scales.dof_vel),
+            self.reindex(self.action_history_buf[:, -1]),
+            self.reindex_feet(self.contact_filt.float() - 0.5),
+        ), dim=-1)
+        priv_explicit = torch.cat((
+            self.base_lin_vel * self.obs_scales.lin_vel,
+            0 * self.base_lin_vel,
+            0 * self.base_lin_vel,
+        ), dim=-1)
+        # ---- Only line changed from parent: add self._xi_values (4 dims) ----
+        priv_latent = torch.cat((
+            self.mass_params_tensor,       # 4: mass + COM offsets
+            self.friction_coeffs_tensor,   # 1: friction
+            self.motor_strength[0] - 1,    # 12: Kp multipliers
+            self.motor_strength[1] - 1,    # 12: Kd multipliers
+            self._xi_values,               # 4: leg length scaling [xi0,xi1,xi2,xi3] ← NEW
+        ), dim=-1)
+        if self.cfg.terrain.measure_heights:
+            heights = torch.clip(
+                self.root_states[:, 2].unsqueeze(1) - 0.3 - self.measured_heights, -1, 1.)
+            self.obs_buf = torch.cat(
+                [obs_buf, heights, priv_explicit, priv_latent,
+                 self.obs_history_buf.view(self.num_envs, -1)], dim=-1)
+        else:
+            self.obs_buf = torch.cat(
+                [obs_buf, priv_explicit, priv_latent,
+                 self.obs_history_buf.view(self.num_envs, -1)], dim=-1)
+        obs_buf[:, 6:8] = 0  # mask yaw in proprioceptive history
+        self.obs_history_buf = torch.where(
+            (self.episode_length_buf <= 1)[:, None, None],
+            torch.stack([obs_buf] * self.cfg.env.history_len, dim=1),
+            torch.cat([self.obs_history_buf[:, 1:], obs_buf.unsqueeze(1)], dim=1)
+        )
+        self.contact_buf = torch.where(
+            (self.episode_length_buf <= 1)[:, None, None],
+            torch.stack([self.contact_filt.float()] * self.cfg.env.contact_buf_len, dim=1),
+            torch.cat([self.contact_buf[:, 1:],
+                       self.contact_filt.float().unsqueeze(1)], dim=1)
+        )
 
     # ------------------------------------------------------------------
     # Accessors

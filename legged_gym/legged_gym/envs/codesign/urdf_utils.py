@@ -274,7 +274,10 @@ class URDFCache:
         """
         key = self._xi_key(xi)
         if key not in self._cache:
-            filename = f"robot_xi_{key[0]:.4f}_{key[1]:.4f}_{key[2]:.4f}_{key[3]:.4f}.urdf"
+            # Use integer representation to avoid dots in filename
+            # (dots confuse Isaac Gym's asset format detection)
+            int_parts = [str(int(round(v * 10000))) for v in key]
+            filename = f"robot_xi_{'_'.join(int_parts)}.urdf"
             filepath = os.path.join(self.cache_dir, filename)
             if not os.path.exists(filepath):
                 urdf_str = build_scaled_urdf(self.base_urdf_path, list(xi))

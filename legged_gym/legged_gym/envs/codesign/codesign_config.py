@@ -13,6 +13,12 @@ class CoDesignCfg(LeggedRobotCfg):
 
     # env class inherits directly from parent — observation dimensions
     # are computed automatically from n_proprio, n_scan, etc.
+    # Override n_priv_latent to include structure parameters (xi values).
+    class env(LeggedRobotCfg.env):
+        # Override: paper requires structure params xi (4 dims) in privileged latent
+        n_priv_latent = 33  # 4(mass+COM) + 1(friction) + 4(xi) + 24(motor) = 33
+        # Recompute total: 53(proprio) + 132(scan) + 530(history) + 33(latent) + 9(explicit)
+        num_observations = 757
 
     class asset(LeggedRobotCfg.asset):
         file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/parkour_quadruped/urdf/parkour_quadruped_a1_style_v2.urdf'
