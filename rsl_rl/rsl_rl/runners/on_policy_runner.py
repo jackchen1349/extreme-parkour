@@ -216,8 +216,8 @@ class OnPolicyRunner:
                     self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             ep_infos.clear()
         
-        # self.current_learning_iteration += num_learning_iterations
-        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        # 使用 tot_iter（总迭代次数）命名最终模型，不修改 current_learning_iteration
+        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(tot_iter)))
 
     def learn_vision(self, num_learning_iterations, init_at_random_ep_len=False):
         tot_iter = self.current_learning_iteration + num_learning_iterations
