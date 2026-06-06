@@ -21,7 +21,7 @@ class CoDesignCfg(LeggedRobotCfg):
         num_observations = 757
 
     class asset(LeggedRobotCfg.asset):
-        file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/parkour_quadruped/urdf/parkour_quadruped_a1_style_v2.urdf'
+        file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/parkour_quadruped/urdf/parkour_quadruped_a1_style_v3.urdf'
         foot_name = "foot"
         penalize_contacts_on = ["thigh", "calf", "base"]
         terminate_after_contacts_on = ["base"]
@@ -29,9 +29,9 @@ class CoDesignCfg(LeggedRobotCfg):
 
     class control(LeggedRobotCfg.control):
         control_type = 'P'
-        # Paper default PD parameters: k~p = 40, k~d = 0.7  (Eq 2)
+        # Paper default PD parameters: k~p = 40, k~d = 1.0  (Eq 2)
         stiffness = {'joint': 40.}
-        damping = {'joint': 0.7}
+        damping = {'joint': 1.0}
         action_scale = 0.25
         decimation = 4
 
@@ -69,8 +69,9 @@ class CoDesignCfg(LeggedRobotCfg):
 
         # PD correction polynomial coefficients (Eq 1):
         #   eta_i = a * xi^3 + b * xi^2 + c * xi + d
-        # Default: linear scaling (a=0, b=0, c=1, d=0) => eta_i = xi
-        pd_correction_coeffs = [0.0, 0.0, 1.0, 0.0]  # [a, b, c, d]
+        # BO-optimized (30 eval, 500 iters/ea): fitness 0.2608 vs baseline 0.0807 (+223%)
+        # eta = -0.455*xi^3 + 0.346*xi^2 + 0.935*xi - 0.279
+        pd_correction_coeffs = [-0.4545, 0.3459, 0.9346, -0.2786]  # [a, b, c, d]
 
 
 class CoDesignCfgPPO(LeggedRobotCfgPPO):

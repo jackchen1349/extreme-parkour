@@ -44,15 +44,15 @@ def train(args):
                entity="jackchen1349-shenzhen", group=args.exptid[:3],
                mode=mode, dir="../../logs")
 
-    # Create env using pre-registered "codesign" task (envs/__init__.py)
-    env, env_cfg = task_registry.make_env(name="codesign", args=args)
+    # Create env using task from args (default: "codesign", registered in envs/__init__.py)
+    env, env_cfg = task_registry.make_env(name=args.task, args=args)
 
     # Log full structured config to wandb
     wandb.config.update({"env_cfg": class_to_dict(env_cfg)})
 
     # Create runner (uses CoDesignPPO with gamma_reg=0.98 from config)
     ppo_runner, train_cfg = task_registry.make_alg_runner(
-        log_root=log_pth, env=env, name="codesign", args=args)
+        log_root=log_pth, env=env, name=args.task, args=args)
 
     wandb.config.update({"train_cfg": class_to_dict(train_cfg)})
 
@@ -63,7 +63,18 @@ def train(args):
     ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations,
                      init_at_random_ep_len=True)
 
+    # 上传最终模型到 wandb
+    import glob
+    model_files = glob.glob(os.path.join(log_pth, 'model_*.pt'))
+    if model_files:
+        latest = max(model_files, key=os.path.getmtime)
+        wandb.save(latest, policy="now")
+        print(f"已上传最终模型到 wandb: {os.path.basename(latest)}")
+
 
 if __name__ == '__main__':
     args = get_args()
+    # 本脚本默认使用 "codesign" 任务（可通过 --task 覆盖）
+    if args.task == 'a1':  # get_args() 的默认值，说明用户未显式指定 --task
+        args.task = 'codesign'
     train(args)

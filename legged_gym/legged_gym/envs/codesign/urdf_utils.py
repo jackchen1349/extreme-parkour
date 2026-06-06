@@ -2,6 +2,14 @@
 #
 # Implements Table 2 from the paper: scales leg link geometry, mass,
 # inertia, and joint origins by leg-length scaling factors xi.
+#
+# Reference: Chen et al., "Structure-control Co-design of Quadruped
+# Robots Based on Pre-training-Fine-tuning Framework", ROBOT, 2025.
+#
+# Nominal parameters extracted from parkour_quadruped_a1_style_v3.urdf.
+# v3 geometry: visual/collision are boxes with explicit dimensions;
+# collision boxes have rpy=(0, 90deg, 0) so the raw X dimension maps
+# to the leg-length Z axis.
 
 import os
 import copy
@@ -11,7 +19,7 @@ from typing import Dict, List, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Per-link nominal parameters extracted from parkour_quadruped_a1_style_v2.urdf
+# Per-link nominal parameters extracted from parkour_quadruped_a1_style_v3.urdf
 # ---------------------------------------------------------------------------
 
 # The 4 scaling factors:
@@ -27,19 +35,24 @@ LEG_PREFIXES = ["FR", "FL", "RR", "RL"]
 THIGH_XI_IDX = {"FR": 0, "FL": 0, "RR": 2, "RL": 2}
 CALF_XI_IDX  = {"FR": 1, "FL": 1, "RR": 3, "RL": 3}
 
-# Nominal (xi=1.0) values for thigh links
+# Nominal (xi=1.0) values for thigh links (v3: box geometry)
 THIGH_NOMINAL = {
-    # visual cylinder
+    # visual box (0.022, 0.022, 0.20) — only z-size scales with xi
     "visual_origin_z": -0.10,
-    "visual_cyl_length": 0.20,
-    # collision box
-    "collision_origin_z": -0.08,
-    "collision_box_zsize": 0.20,
+    "visual_scale_axis": "z",          # which box dimension is the leg length
+    "visual_length_val": 0.20,
+    "visual_other_dims": [0.022, 0.022],  # cross-section (x, y or y, x)
+    # collision box rpy=(0, 90deg, 0), raw(x, y, z) = (0.2, 0.0245, 0.034)
+    # After Y-rotation: raw X → new Z (leg length). Must scale raw X.
+    "collision_origin_z": -0.1,
+    "collision_scale_axis": "x",       # raw X becomes leg length after rotation
+    "collision_length_val": 0.2,
+    "collision_other_dims": [0.0245, 0.034],  # (raw Y, raw Z) = cross-section
     # mass
     "mass": 1.013,
     # inertial origin z
     "inertial_origin_z": -0.027326,
-    # inertia (ixx, iyy, izz) at nominal scale
+    # inertia (ixx, iyy, izz) at nominal scale — scaled by xi per Table 2
     "inertia_ixx": 0.005529065,
     "inertia_iyy": 0.005139339,
     "inertia_izz": 0.001367788,
@@ -48,14 +61,17 @@ THIGH_NOMINAL = {
 }
 
 CALF_NOMINAL = {
-    # visual cylinder
+    # visual box (0.015, 0.015, 0.21012) — only z-size scales with xi
     "visual_origin_z": -0.10506,
-    "visual_cyl_length": 0.21012,
-    # collision cylinders (two of them)
-    "collision1_origin_z": -0.03,
-    "collision1_cyl_length": 0.12,
-    "collision2_origin_z": -0.14,
-    "collision2_cyl_length": 0.10,
+    "visual_scale_axis": "z",
+    "visual_length_val": 0.21012,
+    "visual_other_dims": [0.015, 0.015],
+    # collision box rpy=(0, 90deg, 0), raw(x, y, z) = (0.2, 0.016, 0.016)
+    # After Y-rotation: raw X → new Z (leg length). Must scale raw X.
+    "collision_origin_z": -0.1,
+    "collision_scale_axis": "x",
+    "collision_length_val": 0.2,
+    "collision_other_dims": [0.016, 0.016],
     # mass
     "mass": 0.166,
     # inertial origin z
@@ -64,34 +80,52 @@ CALF_NOMINAL = {
     "inertia_ixx": 0.002997972,
     "inertia_iyy": 0.003014022,
     "inertia_izz": 3.2426e-05,
-    # foot fixed joint origin z (attached to calf)
-    "foot_joint_origin_z": -0.21012,
+    # foot fixed joint origin z (v3: -0.2, v2 was -0.21012)
+    "foot_joint_origin_z": -0.2,
 }
 
 
 def _scale_inertia(ixx: float, iyy: float, izz: float,
-                   mass_scale: float, length_scale: float) -> Tuple[float, float, float]:
-    """Scale inertia tensor.
+                   mass_scale: float) -> Tuple[float, float, float]:
+    """Scale inertia tensor per paper Table 2: I ∝ mass ∝ xi.
 
-    For a cylinder, I ∝ m * l². When both mass and length scale, the
-    perpendicular axes (ixx, iyy) scale as m*l² and the axial axis (izz)
-    scales as m (or m*r² if radius also scales). The paper scales geometry
-    proportionally, so we use:
-        ixx' = ixx * mass_scale * length_scale^2
-        iyy' = iyy * mass_scale * length_scale^2
-        izz' = izz * mass_scale * length_scale^2
+    The paper uses the original link dimensions in the inertia formula
+    (I = (m/12)*(b² + l²) with original l), so only the mass factor
+    changes: I_new = I_old * mass_scale = I_old * xi.
     """
-    scale = mass_scale * (length_scale ** 2)
-    return ixx * scale, iyy * scale, izz * scale
+    return ixx * mass_scale, iyy * mass_scale, izz * mass_scale
+
+
+def _set_box_dim(elem, axis: str, new_val: float, other_vals: List[float]):
+    """Set box size dimension identified by axis ('x','y','z').
+
+    For a box <box size="sx sy sz"/>, sets the dimension corresponding
+    to `axis` to `new_val` and leaves the other two at `other_vals`.
+    """
+    axis_map = {"x": 0, "y": 1, "z": 2}
+    idx = axis_map[axis]
+    parts = [0.0, 0.0, 0.0]
+    other_idx = 0
+    for i in range(3):
+        if i == idx:
+            parts[i] = new_val
+        else:
+            parts[i] = other_vals[other_idx]
+            other_idx += 1
+    elem.set("size", f"{parts[0]:.8g} {parts[1]:.8g} {parts[2]:.8g}")
 
 
 def build_scaled_urdf(base_urdf_path: str, xi: List[float]) -> str:
     """Build a scaled URDF string from the base URDF.
 
+    Implements Table 2 scaling: origins, geometry, mass, inertia all
+    scale by the appropriate xi factor. Only the leg-length dimension
+    is scaled; cross-sections remain unchanged.
+
     Parameters
     ----------
     base_urdf_path : str
-        Path to the base URDF file (parkour_quadruped_a1_style_v2.urdf).
+        Path to the base URDF file.
     xi : list of float, length 4
         Scaling factors: [front_thigh, front_calf, rear_thigh, rear_calf].
 
@@ -105,7 +139,7 @@ def build_scaled_urdf(base_urdf_path: str, xi: List[float]) -> str:
     tree = ET.parse(base_urdf_path)
     root = tree.getroot()
 
-    # ---- Helper: find element by link name ----
+    # ---- helpers ----
     def find_link(name: str):
         for link in root.findall("link"):
             if link.get("name") == name:
@@ -127,127 +161,89 @@ def build_scaled_urdf(base_urdf_path: str, xi: List[float]) -> str:
             parts[2] = f"{new_z:.8g}"
             origin.set("xyz", " ".join(parts))
 
-    def get_origin_z(elem) -> float:
-        origin = elem.find("origin")
-        if origin is not None:
-            xyz = origin.get("xyz", "0 0 0")
-            return float(xyz.split()[2])
-        return 0.0
+    def find_box(elem):
+        """Find the <box> child of a geometry element, if any."""
+        geom = elem.find("geometry")
+        if geom is not None:
+            return geom.find("box")
+        return None
+
+    def process_link(link, nominal: dict, xi_val: float):
+        """Apply Table 2 scaling to a thigh or calf link."""
+        # --- Visual (Table 2: visual origin z, geometry z) ---
+        visual = link.find("visual")
+        if visual is not None:
+            set_origin_z(visual, nominal["visual_origin_z"] * xi_val)
+            box = find_box(visual)
+            if box is not None:
+                new_len = nominal["visual_length_val"] * xi_val
+                axis = nominal["visual_scale_axis"]
+                other = nominal["visual_other_dims"]
+                _set_box_dim(box, axis, new_len, other)
+
+        # --- Collision (Table 2: collision origin z, geometry) ---
+        # v3 has ONE collision element per link (previously v2 had two for calf)
+        collisions = link.findall("collision")
+        for collision in collisions:
+            set_origin_z(collision, nominal["collision_origin_z"] * xi_val)
+            box = find_box(collision)
+            if box is not None:
+                new_len = nominal["collision_length_val"] * xi_val
+                axis = nominal["collision_scale_axis"]
+                other = nominal["collision_other_dims"]
+                _set_box_dim(box, axis, new_len, other)
+
+        # --- Inertial (Table 2: inertial origin z, mass, inertia) ---
+        inertial = link.find("inertial")
+        if inertial is not None:
+            set_origin_z(inertial, nominal["inertial_origin_z"] * xi_val)
+            mass_elem = inertial.find("mass")
+            if mass_elem is not None:
+                mass_elem.set("value", f"{nominal['mass'] * xi_val:.8g}")
+            inertia_elem = inertial.find("inertia")
+            if inertia_elem is not None:
+                si = _scale_inertia(nominal["inertia_ixx"],
+                                    nominal["inertia_iyy"],
+                                    nominal["inertia_izz"],
+                                    xi_val)
+                inertia_elem.set("ixx", f"{si[0]:.8g}")
+                inertia_elem.set("ixy", "0.0")
+                inertia_elem.set("ixz", "0.0")
+                inertia_elem.set("iyy", f"{si[1]:.8g}")
+                inertia_elem.set("iyz", "0.0")
+                inertia_elem.set("izz", f"{si[2]:.8g}")
 
     # ---- Process each leg ----
     for prefix in LEG_PREFIXES:
         thigh_xi = xi[THIGH_XI_IDX[prefix]]
         calf_xi  = xi[CALF_XI_IDX[prefix]]
 
-        # --- Thigh link ---
+        # Thigh link
         thigh_link = find_link(f"{prefix}_thigh")
         if thigh_link is not None:
-            # Visual: origin z and cylinder length
-            visual = thigh_link.find("visual")
-            if visual is not None:
-                set_origin_z(visual, THIGH_NOMINAL["visual_origin_z"] * thigh_xi)
-                geom = visual.find("geometry")
-                if geom is not None:
-                    cyl = geom.find("cylinder")
-                    if cyl is not None:
-                        cyl.set("length", f"{THIGH_NOMINAL['visual_cyl_length'] * thigh_xi:.8g}")
+            process_link(thigh_link, THIGH_NOMINAL, thigh_xi)
 
-            # Collision: origin z and box z-size
-            collision = thigh_link.find("collision")
-            if collision is not None:
-                set_origin_z(collision, THIGH_NOMINAL["collision_origin_z"] * thigh_xi)
-                geom = collision.find("geometry")
-                if geom is not None:
-                    box = geom.find("box")
-                    if box is not None:
-                        size = box.get("size", "0 0 0")
-                        parts = size.split()
-                        parts[2] = f"{THIGH_NOMINAL['collision_box_zsize'] * thigh_xi:.8g}"
-                        box.set("size", " ".join(parts))
-
-            # Inertial: mass, inertia, origin z
-            inertial = thigh_link.find("inertial")
-            if inertial is not None:
-                set_origin_z(inertial, THIGH_NOMINAL["inertial_origin_z"] * thigh_xi)
-                mass_elem = inertial.find("mass")
-                if mass_elem is not None:
-                    mass_elem.set("value", f"{THIGH_NOMINAL['mass'] * thigh_xi:.8g}")
-                inertia_elem = inertial.find("inertia")
-                if inertia_elem is not None:
-                    si = _scale_inertia(THIGH_NOMINAL["inertia_ixx"],
-                                        THIGH_NOMINAL["inertia_iyy"],
-                                        THIGH_NOMINAL["inertia_izz"],
-                                        thigh_xi, thigh_xi)
-                    inertia_elem.set("ixx", f"{si[0]:.8g}")
-                    inertia_elem.set("ixy", "0.0")  # simplified
-                    inertia_elem.set("ixz", "0.0")
-                    inertia_elem.set("iyy", f"{si[1]:.8g}")
-                    inertia_elem.set("iyz", "0.0")
-                    inertia_elem.set("izz", f"{si[2]:.8g}")
-
-        # --- Calf joint ---
+        # Calf joint (Table 2: knee joint origin z)
         calf_joint = find_joint(f"{prefix}_calf_joint")
         if calf_joint is not None:
             set_origin_z(calf_joint, THIGH_NOMINAL["calf_joint_origin_z"] * thigh_xi)
 
-        # --- Calf link ---
+        # Calf link
         calf_link = find_link(f"{prefix}_calf")
         if calf_link is not None:
-            visual = calf_link.find("visual")
-            if visual is not None:
-                set_origin_z(visual, CALF_NOMINAL["visual_origin_z"] * calf_xi)
-                geom = visual.find("geometry")
-                if geom is not None:
-                    cyl = geom.find("cylinder")
-                    if cyl is not None:
-                        cyl.set("length", f"{CALF_NOMINAL['visual_cyl_length'] * calf_xi:.8g}")
+            process_link(calf_link, CALF_NOMINAL, calf_xi)
 
-            # Collisions (two collision elements per calf)
-            collisions = calf_link.findall("collision")
-            if len(collisions) >= 1:
-                set_origin_z(collisions[0], CALF_NOMINAL["collision1_origin_z"] * calf_xi)
-                geom = collisions[0].find("geometry")
-                if geom is not None:
-                    cyl = geom.find("cylinder")
-                    if cyl is not None:
-                        cyl.set("length", f"{CALF_NOMINAL['collision1_cyl_length'] * calf_xi:.8g}")
-            if len(collisions) >= 2:
-                set_origin_z(collisions[1], CALF_NOMINAL["collision2_origin_z"] * calf_xi)
-                geom = collisions[1].find("geometry")
-                if geom is not None:
-                    cyl = geom.find("cylinder")
-                    if cyl is not None:
-                        cyl.set("length", f"{CALF_NOMINAL['collision2_cyl_length'] * calf_xi:.8g}")
-
-            # Inertial
-            inertial = calf_link.find("inertial")
-            if inertial is not None:
-                set_origin_z(inertial, CALF_NOMINAL["inertial_origin_z"] * calf_xi)
-                mass_elem = inertial.find("mass")
-                if mass_elem is not None:
-                    mass_elem.set("value", f"{CALF_NOMINAL['mass'] * calf_xi:.8g}")
-                inertia_elem = inertial.find("inertia")
-                if inertia_elem is not None:
-                    si = _scale_inertia(CALF_NOMINAL["inertia_ixx"],
-                                        CALF_NOMINAL["inertia_iyy"],
-                                        CALF_NOMINAL["inertia_izz"],
-                                        calf_xi, calf_xi)
-                    inertia_elem.set("ixx", f"{si[0]:.8g}")
-                    inertia_elem.set("ixy", "0.0")
-                    inertia_elem.set("ixz", "0.0")
-                    inertia_elem.set("iyy", f"{si[1]:.8g}")
-                    inertia_elem.set("iyz", "0.0")
-                    inertia_elem.set("izz", f"{si[2]:.8g}")
-
-        # --- Foot fixed joint ---
+        # Foot fixed joint (Table 2: ankle joint origin z)
         foot_joint = find_joint(f"{prefix}_foot_fixed")
         if foot_joint is not None:
             set_origin_z(foot_joint, CALF_NOMINAL["foot_joint_origin_z"] * calf_xi)
 
-    # Return the modified URDF as a string
-    # Use a declaration that preserves UTF-8
     return '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(root, encoding="unicode")
 
+
+# ---------------------------------------------------------------------------
+# URDF Cache
+# ---------------------------------------------------------------------------
 
 class URDFCache:
     """Cache for generated URDF files to avoid redundant file I/O.
@@ -259,7 +255,7 @@ class URDFCache:
     def __init__(self, base_urdf_path: str, cache_dir: str = "/tmp/codesign_urdf"):
         self.base_urdf_path = base_urdf_path
         self.cache_dir = cache_dir
-        self._cache: Dict[Tuple[float, ...], str] = {}  # (xi0,xi1,xi2,xi3) -> file_path
+        self._cache: Dict[Tuple[float, ...], str] = {}
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def _xi_key(self, xi: List[float]) -> Tuple[float, ...]:
@@ -267,15 +263,10 @@ class URDFCache:
         return tuple(round(float(v), 6) for v in xi)
 
     def get_urdf_path(self, xi: List[float]) -> str:
-        """Return the file path to a URDF with the given scaling factors.
-
-        Generates the URDF on first access; returns cached path on
-        subsequent calls.
-        """
+        """Return the file path to a URDF with the given scaling factors."""
         key = self._xi_key(xi)
         if key not in self._cache:
-            # Use integer representation to avoid dots in filename
-            # (dots confuse Isaac Gym's asset format detection)
+            # Integer representation to avoid dots in filename
             int_parts = [str(int(round(v * 10000))) for v in key]
             filename = f"robot_xi_{'_'.join(int_parts)}.urdf"
             filepath = os.path.join(self.cache_dir, filename)
@@ -301,7 +292,7 @@ class URDFCache:
 
 
 # ---------------------------------------------------------------------------
-# PD correction factor  (Eq 1)
+# PD correction factor (Eq 1)
 # ---------------------------------------------------------------------------
 
 def compute_pd_correction(xi: float, coeffs: List[float]) -> float:
