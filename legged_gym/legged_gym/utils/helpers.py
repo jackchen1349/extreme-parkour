@@ -179,7 +179,7 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
 
     return env_cfg, cfg_train
 
-def get_args():
+def get_args(extra_parameters=None):
     custom_parameters = [
         {"name": "--task", "type": str, "default": "a1", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
         {"name": "--resume", "action": "store_true", "default": False,  "help": "Resume training from a checkpoint"},
@@ -223,6 +223,8 @@ def get_args():
 
 
     ]
+    if extra_parameters:
+        custom_parameters = custom_parameters + extra_parameters
     # parse arguments
     args = parse_arguments(
         description="RL Policy",

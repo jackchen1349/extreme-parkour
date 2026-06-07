@@ -83,8 +83,16 @@ class CoDesignLeggedRobot(LeggedRobot):
                     xi_unique[:remainder]
                 ], dim=0)  # stays on CPU
         else:
-            self._xi_values = torch.ones(self.cfg.env.num_envs, 4,
-                                         dtype=torch.float, device='cpu')
+            # Support fixed target_xi for fine-tuning (set via config before make_env)
+            target = getattr(sr, 'target_xi', None)
+            if target is not None:
+                num_envs = self.cfg.env.num_envs
+                self._xi_values = torch.tensor(
+                    target, dtype=torch.float, device='cpu'
+                ).unsqueeze(0).expand(num_envs, -1).contiguous()
+            else:
+                self._xi_values = torch.ones(self.cfg.env.num_envs, 4,
+                                             dtype=torch.float, device='cpu')
 
     # ------------------------------------------------------------------
     # Environment creation with per-morphology URDF assets
@@ -154,6 +162,25 @@ class CoDesignLeggedRobot(LeggedRobot):
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
         self.num_bodies = len(body_names)
         self.num_dofs = len(self.dof_names)
+
+        # Build body name -> index map for mass/COM extraction.
+        # Isaac Gym merges links connected by fixed joints, so "base" is the
+        # combined base+trunk+camera_box+imu_link rigid body.
+        _body_idx = {name: i for i, name in enumerate(body_names)}
+        self._trunk_idx = _body_idx["base"]  # merged base+trunk in Isaac Gym
+        self._hip_body_indices = {
+            "front": [_body_idx["FR_hip"], _body_idx["FL_hip"]],
+            "rear":  [_body_idx["RR_hip"], _body_idx["RL_hip"]],
+        }
+        self._thigh_body_indices = {
+            "front": [_body_idx["FR_thigh"], _body_idx["FL_thigh"]],
+            "rear":  [_body_idx["RR_thigh"], _body_idx["RL_thigh"]],
+        }
+        self._calf_body_indices = {
+            "front": [_body_idx["FR_calf"], _body_idx["FL_calf"]],
+            "rear":  [_body_idx["RR_calf"], _body_idx["RL_calf"]],
+        }
+
         feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
 
         # Create force sensors on each unique asset
@@ -190,6 +217,10 @@ class CoDesignLeggedRobot(LeggedRobot):
         self.cam_tensors = []
         self.mass_params_tensor = torch.zeros(self.num_envs, 4, dtype=torch.float,
                                                device=self.device, requires_grad=False)
+        self.body_mass_tensor = torch.zeros(self.num_envs, 6, dtype=torch.float,
+                                             device=self.device, requires_grad=False)
+        self.body_com_tensor = torch.zeros(self.num_envs, 15, dtype=torch.float,
+                                            device=self.device, requires_grad=False)
 
         print("Creating env...")
         for i in tqdm(range(self.num_envs)):
@@ -223,7 +254,105 @@ class CoDesignLeggedRobot(LeggedRobot):
             dof_props = self._process_dof_props(asset_dof_props, i)
             self.gym.set_actor_dof_properties(env_handle, anymal_handle, dof_props)
             body_props = self.gym.get_actor_rigid_body_properties(env_handle, anymal_handle)
+
+            # ---- Read raw (pre-randomization) body masses and COM for priv_latent ----
+            raw_trunk_mass = body_props[self._trunk_idx].mass
+            raw_trunk_com = [body_props[self._trunk_idx].com.x,
+                             body_props[self._trunk_idx].com.y,
+                             body_props[self._trunk_idx].com.z]
+            hip_flat = [idx for idxs in self._hip_body_indices.values() for idx in idxs]
+            raw_hip_mass = np.mean([body_props[idx].mass for idx in hip_flat])
+            raw_thigh_mass_f = np.mean([body_props[idx].mass for idx in self._thigh_body_indices["front"]])
+            raw_thigh_mass_r = np.mean([body_props[idx].mass for idx in self._thigh_body_indices["rear"]])
+            raw_thigh_com_f  = self._average_body_com(body_props, self._thigh_body_indices["front"])
+            raw_thigh_com_r  = self._average_body_com(body_props, self._thigh_body_indices["rear"])
+            raw_calf_mass_f  = np.mean([body_props[idx].mass for idx in self._calf_body_indices["front"]])
+            raw_calf_mass_r  = np.mean([body_props[idx].mass for idx in self._calf_body_indices["rear"]])
+            raw_calf_com_f   = self._average_body_com(body_props, self._calf_body_indices["front"])
+            raw_calf_com_r   = self._average_body_com(body_props, self._calf_body_indices["rear"])
+
+            # Apply parent's trunk randomization, then our own body mass/COM domain rand
             body_props, mass_params = self._process_rigid_body_props(body_props, i)
+
+            # ---- Body mass/COM domain randomization ----
+            # Trunk: parent's _process_rigid_body_props already applied additive rand
+            #        (added_mass_range + added_com_range). Use post-rand values directly.
+            # Legs:  apply multiplicative mass + additive COM perturbation.
+            rng = np.random.RandomState(i * 9973)
+
+            trunk_mass_post = body_props[self._trunk_idx].mass
+            trunk_com_post = [body_props[self._trunk_idx].com.x,
+                              body_props[self._trunk_idx].com.y,
+                              body_props[self._trunk_idx].com.z]
+
+            leg_mass_factor = np.ones(5)    # [hip, thigh_f, thigh_r, calf_f, calf_r]
+            leg_com_offset = np.zeros(12)   # [thigh_f(3), thigh_r(3), calf_f(3), calf_r(3)]
+
+            if self.cfg.domain_rand.randomize_body_mass:
+                leg_mass_factor = rng.uniform(
+                    self.cfg.domain_rand.leg_mass_range[0],
+                    self.cfg.domain_rand.leg_mass_range[1], size=5)
+                for idx in hip_flat:
+                    body_props[idx].mass *= leg_mass_factor[0]
+                for idx in self._thigh_body_indices["front"]:
+                    body_props[idx].mass *= leg_mass_factor[1]
+                for idx in self._thigh_body_indices["rear"]:
+                    body_props[idx].mass *= leg_mass_factor[2]
+                for idx in self._calf_body_indices["front"]:
+                    body_props[idx].mass *= leg_mass_factor[3]
+                for idx in self._calf_body_indices["rear"]:
+                    body_props[idx].mass *= leg_mass_factor[4]
+
+            if self.cfg.domain_rand.randomize_body_com:
+                leg_com_offset = rng.uniform(
+                    self.cfg.domain_rand.leg_com_range[0],
+                    self.cfg.domain_rand.leg_com_range[1], size=12)
+                for idx in self._thigh_body_indices["front"]:
+                    body_props[idx].com = gymapi.Vec3(
+                        raw_thigh_com_f[0] + leg_com_offset[0],
+                        raw_thigh_com_f[1] + leg_com_offset[1],
+                        raw_thigh_com_f[2] + leg_com_offset[2])
+                for idx in self._thigh_body_indices["rear"]:
+                    body_props[idx].com = gymapi.Vec3(
+                        raw_thigh_com_r[0] + leg_com_offset[3],
+                        raw_thigh_com_r[1] + leg_com_offset[4],
+                        raw_thigh_com_r[2] + leg_com_offset[5])
+                for idx in self._calf_body_indices["front"]:
+                    body_props[idx].com = gymapi.Vec3(
+                        raw_calf_com_f[0] + leg_com_offset[6],
+                        raw_calf_com_f[1] + leg_com_offset[7],
+                        raw_calf_com_f[2] + leg_com_offset[8])
+                for idx in self._calf_body_indices["rear"]:
+                    body_props[idx].com = gymapi.Vec3(
+                        raw_calf_com_r[0] + leg_com_offset[9],
+                        raw_calf_com_r[1] + leg_com_offset[10],
+                        raw_calf_com_r[2] + leg_com_offset[11])
+
+            # Assemble tensors: trunk uses post-parent-rand, legs use perturbed values
+            body_mass_arr = np.array([
+                trunk_mass_post,
+                raw_hip_mass * leg_mass_factor[0],
+                raw_thigh_mass_f * leg_mass_factor[1],
+                raw_thigh_mass_r * leg_mass_factor[2],
+                raw_calf_mass_f * leg_mass_factor[3],
+                raw_calf_mass_r * leg_mass_factor[4],
+            ])
+            body_com_arr = np.array(
+                trunk_com_post +
+                [raw_thigh_com_f[0] + leg_com_offset[0],
+                 raw_thigh_com_f[1] + leg_com_offset[1],
+                 raw_thigh_com_f[2] + leg_com_offset[2]] +
+                [raw_thigh_com_r[0] + leg_com_offset[3],
+                 raw_thigh_com_r[1] + leg_com_offset[4],
+                 raw_thigh_com_r[2] + leg_com_offset[5]] +
+                [raw_calf_com_f[0] + leg_com_offset[6],
+                 raw_calf_com_f[1] + leg_com_offset[7],
+                 raw_calf_com_f[2] + leg_com_offset[8]] +
+                [raw_calf_com_r[0] + leg_com_offset[9],
+                 raw_calf_com_r[1] + leg_com_offset[10],
+                 raw_calf_com_r[2] + leg_com_offset[11]]
+            )
+
             self.gym.set_actor_rigid_body_properties(env_handle, anymal_handle,
                                                       body_props, recomputeInertia=True)
             self.envs.append(env_handle)
@@ -231,9 +360,13 @@ class CoDesignLeggedRobot(LeggedRobot):
 
             self.attach_camera(i, env_handle, anymal_handle)
             self.mass_params_tensor[i, :] = torch.from_numpy(mass_params).to(self.device).to(torch.float)
+            self.body_mass_tensor[i, :] = torch.from_numpy(body_mass_arr).to(self.device).to(torch.float)
+            self.body_com_tensor[i, :] = torch.from_numpy(body_com_arr).to(self.device).to(torch.float)
 
         if self.cfg.domain_rand.randomize_friction:
             self.friction_coeffs_tensor = self.friction_coeffs.to(self.device).to(torch.float).squeeze(-1)
+        else:
+            self.friction_coeffs_tensor = torch.ones(self.num_envs, dtype=torch.float, device=self.device)
 
         # Index body parts (use first env, first actor; same across all morphologies)
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long,
@@ -274,6 +407,18 @@ class CoDesignLeggedRobot(LeggedRobot):
             self.calf_indices[i] = self.dof_names.index(name)
 
     # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _average_body_com(props, indices):
+        """Average COM (x,y,z) across a list of body indices."""
+        x = np.mean([props[i].com.x for i in indices])
+        y = np.mean([props[i].com.y for i in indices])
+        z = np.mean([props[i].com.z for i in indices])
+        return [x, y, z]
+
+    # ------------------------------------------------------------------
     # PD gains with per-environment correction (Eq 1-2)
     # ------------------------------------------------------------------
 
@@ -292,35 +437,50 @@ class CoDesignLeggedRobot(LeggedRobot):
                                            dtype=torch.float, device=self.device,
                                            requires_grad=False)
 
-        # Compute per-environment PD correction factors
-        # For each DOF, find the corresponding xi based on which leg link the DOF belongs to
-        # HipX joints (FR_hip_joint, etc.) and HipY joints (FR_thigh_joint, etc.)
-        # get the correction from their respective xi values.
+        # Compute per-environment PD correction factors for HipY and Knee joints.
+        # HipX (FR_hip_joint, etc.) — hip abduction/adduction — is NOT corrected;
+        # it keeps the base PD gains (kp=40, kd=1.0).
         #
         # Mapping of DOF names to xi indices:
-        #   - FR_hip_joint, FR_thigh_joint → xi[0] (front thigh)
+        #   - FR_hip_joint → (no correction, base gains)
+        #   - FR_thigh_joint → xi[0] (front thigh)
         #   - FR_calf_joint → xi[1] (front calf)
-        #   - FL_hip_joint, FL_thigh_joint → xi[0]
+        #   - FL_hip_joint → (no correction, base gains)
+        #   - FL_thigh_joint → xi[0]
         #   - FL_calf_joint → xi[1]
-        #   - RR_hip_joint, RR_thigh_joint → xi[2] (rear thigh)
+        #   - RR_hip_joint → (no correction, base gains)
+        #   - RR_thigh_joint → xi[2] (rear thigh)
         #   - RR_calf_joint → xi[3] (rear calf)
-        #   - RL_hip_joint, RL_thigh_joint → xi[2]
+        #   - RL_hip_joint → (no correction, base gains)
+        #   - RL_thigh_joint → xi[2]
         #   - RL_calf_joint → xi[3]
 
-        pd_coeffs = self.cfg.spatial_rand.pd_correction_coeffs
+        use_separate = getattr(self.cfg.spatial_rand, 'use_separate_front_rear', False)
+        coeffs_front = (self.cfg.spatial_rand.pd_correction_coeffs_front
+                        if use_separate else self.cfg.spatial_rand.pd_correction_coeffs)
+        coeffs_rear = (self.cfg.spatial_rand.pd_correction_coeffs_rear
+                       if use_separate else self.cfg.spatial_rand.pd_correction_coeffs)
 
         for i in range(self.num_dofs):
             name = self.dof_names[i]
             leg_prefix = name[:2]  # "FR", "FL", "RR", "RL"
 
-            if "calf" in name:
+            if "hip" in name:
+                # HipX (abduction/adduction) — keep base PD gains, no correction
+                self.p_gains_env[:, i] = self.p_gains[i]
+                self.d_gains_env[:, i] = self.d_gains[i]
+                continue
+            elif "calf" in name:
                 xi_idx = CALF_XI_IDX.get(leg_prefix, 0)
             else:
-                # hip_joint or thigh_joint
+                # thigh_joint (HipY — flexion/extension)
                 xi_idx = THIGH_XI_IDX.get(leg_prefix, 0)
 
             # xi value for this DOF across all environments
             xi_env = self._xi_values[:, xi_idx]  # (num_envs,)
+
+            # Select front or rear coefficients
+            pd_coeffs = coeffs_front if leg_prefix in ("FR", "FL") else coeffs_rear
 
             # Compute correction factor (Eq 1): eta = a*xi^3 + b*xi^2 + c*xi + d
             eta = compute_pd_correction(xi_env, pd_coeffs)  # (num_envs,)
@@ -396,14 +556,19 @@ class CoDesignLeggedRobot(LeggedRobot):
             0 * self.base_lin_vel,
             0 * self.base_lin_vel,
         ), dim=-1)
-        # ---- Only line changed from parent: add self._xi_values (4 dims) ----
+        # ---- Replaced mass_params with real body mass/COM ----
+        # Ensure all tensors are 2D before cat
+        friction_2d = self.friction_coeffs_tensor.unsqueeze(-1)  # (N, 1)
+        if friction_2d.dim() > 2:
+            friction_2d = friction_2d.reshape(self.num_envs, -1)
         priv_latent = torch.cat((
-            self.mass_params_tensor,       # 4: mass + COM offsets
-            self.friction_coeffs_tensor,   # 1: friction
-            self.motor_strength[0] - 1,    # 12: Kp multipliers
-            self.motor_strength[1] - 1,    # 12: Kd multipliers
-            self._xi_values,               # 4: leg length scaling [xi0,xi1,xi2,xi3] ← NEW
-        ), dim=-1)
+            self.body_mass_tensor.reshape(self.num_envs, -1),          # 6
+            self.body_com_tensor.reshape(self.num_envs, -1),           # 15
+            friction_2d,                                                # 1
+            (self.motor_strength[0] - 1).reshape(self.num_envs, -1),   # 12
+            (self.motor_strength[1] - 1).reshape(self.num_envs, -1),   # 12
+            self._xi_values.reshape(self.num_envs, -1),                # 4
+        ), dim=-1)  # total: 6+15+1+12+12+4 = 50
         if self.cfg.terrain.measure_heights:
             heights = torch.clip(
                 self.root_states[:, 2].unsqueeze(1) - 0.3 - self.measured_heights, -1, 1.)

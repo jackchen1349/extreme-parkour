@@ -15,10 +15,10 @@ class CoDesignCfg(LeggedRobotCfg):
     # are computed automatically from n_proprio, n_scan, etc.
     # Override n_priv_latent to include structure parameters (xi values).
     class env(LeggedRobotCfg.env):
-        # Override: paper requires structure params xi (4 dims) in privileged latent
-        n_priv_latent = 33  # 4(mass+COM) + 1(friction) + 4(xi) + 24(motor) = 33
-        # Recompute total: 53(proprio) + 132(scan) + 530(history) + 33(latent) + 9(explicit)
-        num_observations = 757
+        # Override: include real body masses (6) + COM (15) + friction(1) + motor(24) + xi(4)
+        n_priv_latent = 50  # mass(6) + COM(15) + friction(1) + Kp(12) + Kd(12) + xi(4) = 50
+        # Recompute total: 53(proprio) + 132(scan) + 530(history) + 50(latent) + 9(explicit)
+        num_observations = 774
 
     class asset(LeggedRobotCfg.asset):
         file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/parkour_quadruped/urdf/parkour_quadruped_a1_style_v3.urdf'
@@ -65,13 +65,27 @@ class CoDesignCfg(LeggedRobotCfg):
 
         # Number of unique URDF variants to generate.
         # Each variant is shared by (num_envs / num_groups) environments.
-        num_groups = 64
+        num_groups = 100
 
         # PD correction polynomial coefficients (Eq 1):
         #   eta_i = a * xi^3 + b * xi^2 + c * xi + d
         # BO-optimized (30 eval, 500 iters/ea): fitness 0.2608 vs baseline 0.0807 (+223%)
         # eta = -0.455*xi^3 + 0.346*xi^2 + 0.935*xi - 0.279
         pd_correction_coeffs = [-0.4545, 0.3459, 0.9346, -0.2786]  # [a, b, c, d]
+
+        # Anchor-optimized (6 anchors x 6 evals/ea): separate front/rear coefficients
+        pd_correction_coeffs_front = [1.143392, -3.473005, 4.272445, -0.978001]
+        pd_correction_coeffs_rear  = [4.624430, -13.867083, 14.072439, -3.899633]
+        use_separate_front_rear = False  # set True to use front/rear separated coefficients
+
+    # ---- Body mass/COM domain randomization for priv_latent ----
+    # Trunk: uses original added_mass_range [0, 3] kg & added_com_range [-0.2, 0.2] m (additive)
+    # Hip/Thigh/Calf: independent multiplicative mass & additive COM perturbation
+    class domain_rand(LeggedRobotCfg.domain_rand):
+        randomize_body_mass = True
+        leg_mass_range = [0.85, 1.15]   # multiplicative factor for hip/thigh/calf
+        randomize_body_com = True
+        leg_com_range = [-0.01, 0.01]   # additive offset (m) for hip/thigh/calf COM
 
 
 class CoDesignCfgPPO(LeggedRobotCfgPPO):

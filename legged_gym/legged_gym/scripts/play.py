@@ -47,6 +47,24 @@ import matplotlib.pyplot as plt
 from time import time, sleep
 from legged_gym.utils import webviewer
 
+_ALL_TERRAIN_KEYS = [
+    "smooth slope", "rough slope up", "rough slope down",
+    "rough stairs up", "rough stairs down", "discrete",
+    "stepping stones", "gaps", "smooth flat",
+    "pit", "wall", "platform",
+    "large stairs up", "large stairs down",
+    "parkour", "parkour_hurdle", "parkour_flat",
+    "parkour_step", "parkour_gap", "demo",
+]
+
+TASK_TERRAIN_MAP = {
+    "jump":      {**{k: 0. for k in _ALL_TERRAIN_KEYS}, "parkour_gap": 1.0},
+    "high_jump": {**{k: 0. for k in _ALL_TERRAIN_KEYS}, "parkour_hurdle": 1.0},
+    "both":      {**{k: 0. for k in _ALL_TERRAIN_KEYS},
+                  "parkour": 0.25, "parkour_hurdle": 0.25,
+                  "parkour_step": 0.25, "parkour_gap": 0.25},
+}
+
 def get_load_path(root, load_run=-1, checkpoint=-1, model_name_include="model"):
     if checkpoint==-1:
         models = [file for file in os.listdir(root) if model_name_include in file]
@@ -63,6 +81,11 @@ def play(args):
     log_pth = "../../logs/{}/".format(args.proj_name) + args.exptid
 
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+    if args.task == "codesign" and args.xi is not None:
+        xi_list = [float(x) for x in args.xi.split(",")]
+        assert len(xi_list) == 4, f"Expected 4 xi values, got {len(xi_list)}"
+        env_cfg.spatial_rand.enable = False
+        env_cfg.spatial_rand.target_xi = xi_list
     # override some parameters for testing
     if args.nodelay:
         env_cfg.domain_rand.action_delay_view = 0
@@ -94,6 +117,9 @@ def play(args):
                                     "demo": 0.2}
     
     env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
+    if args.task_type is not None and args.task_type in TASK_TERRAIN_MAP:
+        env_cfg.terrain.terrain_dict = dict(TASK_TERRAIN_MAP[args.task_type])
+        env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.max_difficulty = True
     
@@ -181,5 +207,13 @@ if __name__ == '__main__':
     EXPORT_POLICY = False
     RECORD_FRAMES = False
     MOVE_CAMERA = False
-    args = get_args()
+    play_params = [
+        {"name": "--xi", "type": str, "default": None,
+         "help": "Comma-separated 4 leg-length scaling factors (only with --task codesign): "
+                 "front_thigh,front_calf,rear_thigh,rear_calf"},
+        {"name": "--task_type", "type": str, "default": None,
+         "choices": ["jump", "high_jump", "both"],
+         "help": "Terrain type: jump (only gap), high_jump (only hurdle), both (all parkour)"},
+    ]
+    args = get_args(extra_parameters=play_params)
     play(args)

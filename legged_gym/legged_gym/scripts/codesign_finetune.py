@@ -4,159 +4,168 @@
 Phase 2 of the paper's pre-training-fine-tuning framework:
 - Loads a pre-trained policy (from Phase 1 pre-training)
 - Uses Bayesian optimization to search for optimal leg-length scaling factors
-- For each candidate xi, fine-tunes the pre-trained policy for ~400 steps
+- For each candidate xi, spawns a subprocess that fine-tunes and evaluates
 - Fitness = non-discounted cumulative reward (Eq 7)
+- --task_type controls which terrain is used for evaluation:
+    jump      -> parkour_gap only
+    high_jump -> parkour_hurdle only
+    both      -> all 5 parkour types
 
 Usage:
-    python codesign_finetune.py --exptid 002-00-FINETUNE --resume \
-        --resumeid 001-00-PRETRAIN --checkpoint 6000 --device cuda:0
+    python codesign_finetune.py --exptid 011-00-FINETUNE --resume \
+        --resumeid 010-00 --checkpoint 6000 --device cuda:0 --task_type jump
 """
 
 import os
 import sys
+import json
+import subprocess
+import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LEGGED_GYM_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, os.path.dirname(LEGGED_GYM_DIR))
 
+# Isaac Gym MUST be imported before torch (required by helpers import chain)
 import isaacgym  # noqa: F401
 
-import torch
 import numpy as np
-from copy import deepcopy
-import argparse
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
-from legged_gym.envs.codesign.codesign_config import CoDesignCfg, CoDesignCfgPPO
-from legged_gym.envs.codesign.codesign_robot import CoDesignLeggedRobot
-from legged_gym.utils.task_registry import task_registry
-from legged_gym.utils.helpers import get_load_path, class_to_dict, update_cfg_from_args
+
+# Import from legged_gym.envs first to resolve circular import:
+#   legged_gym.utils -> task_registry -> legged_gym.envs.base.legged_robot_config
+#   -> legged_gym.envs.__init__ -> task_registry (CIRCULAR)
+# By importing from legged_gym.envs first, task_registry initializes cleanly.
+from legged_gym.envs.codesign.codesign_config import CoDesignCfg, CoDesignCfgPPO  # noqa: F401
+
+from legged_gym.utils.helpers import get_load_path, get_args
 from legged_gym.utils.bayesian_optimizer import BayesianOptimizer
+
+# Path to worker script
+FINETUNE_WORKER_SCRIPT = os.path.join(SCRIPT_DIR, "_finetune_worker.py")
 
 
 def get_finetune_args():
-    """Parse arguments for fine-tuning + BO."""
-    parser = argparse.ArgumentParser(
-        description="Co-Design Fine-tuning with Bayesian Optimization"
-    )
-    parser.add_argument("--task", type=str, default="codesign", help="Task name")
-    parser.add_argument("--exptid", type=str, required=True,
-                        help="Experiment ID for this fine-tuning run")
-    parser.add_argument("--resumeid", type=str, required=True,
-                        help="Pre-trained experiment ID to load from")
-    parser.add_argument("--checkpoint", type=int, default=-1,
-                        help="Checkpoint iteration to load (-1 = latest)")
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--headless", action="store_true", default=False)
-    parser.add_argument("--num_envs", type=int, default=None,
-                        help="Number of environments for fine-tuning")
-    parser.add_argument("--n_init", type=int, default=5,
-                        help="BO initial random samples")
-    parser.add_argument("--n_iter", type=int, default=15,
-                        help="BO optimization iterations")
-    parser.add_argument("--finetune_steps", type=int, default=400,
-                        help="Fine-tuning steps per BO iteration")
-    parser.add_argument("--eval_episodes", type=int, default=2,
-                        help="Number of evaluation episodes for fitness")
-    parser.add_argument("--task_type", type=str, default="both",
-                        choices=["jump", "high_jump", "both"],
-                        help="Task type for fitness evaluation")
-    parser.add_argument("--debug", action="store_true", default=False,
-                        help="Debug mode: fewer envs")
-    parser.add_argument("--no_wandb", action="store_true", default=False,
-                        help="Disable wandb logging")
-    parser.add_argument("--proj_name", type=str, default="parkour_new",
-                        help="Wandb project name")
-    parser.add_argument("--web", action="store_true", default=False)
-    return parser.parse_args()
+    """Parse arguments for fine-tuning + BO, reusing get_args as base."""
+    finetune_params = [
+        {"name": "--n_init", "type": int, "default": 5,
+         "help": "BO initial random samples"},
+        {"name": "--n_iter", "type": int, "default": 15,
+         "help": "BO optimization iterations"},
+        {"name": "--finetune_steps", "type": int, "default": 400,
+         "help": "Fine-tuning steps per BO iteration"},
+        {"name": "--eval_episodes", "type": int, "default": 2,
+         "help": "Evaluation episodes for fitness"},
+        {"name": "--task_type", "type": str, "default": "both",
+         "choices": ["jump", "high_jump", "both"],
+         "help": "Terrain type for fitness evaluation"},
+    ]
+    args = get_args(extra_parameters=finetune_params)
+    if args.task == "a1":  # override get_args default for finetune
+        args.task = "codesign"
+    return args
 
 
-def evaluate_fitness(env, runner, num_episodes: int = 2,
-                     episode_length_s: float = 20.0) -> float:
-    """Evaluate policy fitness (Eq 7): non-discounted cumulative reward.
-
-    f = (1/N) * sum_i sum_t r(s_t^i, a_t^i)
+def evaluate_candidate(xi, checkpoint_path, args, bo_iter):
+    """Run one fine-tuning + evaluation in a subprocess.
 
     Parameters
     ----------
-    env : CoDesignLeggedRobot
-        Environment.
-    runner : OnPolicyRunner
-        Policy runner.
-    num_episodes : int
-        Number of evaluation episodes per environment.
-    episode_length_s : float
-        Episode length in seconds.
+    xi : ndarray (4,)
+        Candidate [front_thigh, front_calf, rear_thigh, rear_calf].
+    checkpoint_path : str
+        Absolute path to pre-trained model checkpoint.
+    args : argparse.Namespace
+        Experiment configuration.
+    bo_iter : int
+        Index of this BO iteration.
 
     Returns
     -------
-    float
-        Mean non-discounted cumulative reward.
+    tuple (ndarray, float)
+        The evaluated xi and fitness.
     """
-    runner.alg.actor_critic.eval()
-    total_reward = 0.0
-    total_steps = 0
+    xi_str = ",".join(f"{v:.6f}" for v in xi)
+    tag = f"{args.exptid}_{bo_iter:03d}"
+    result_file = f"/tmp/finetune_result_{tag}.json"
 
-    max_steps = int(episode_length_s / (env.dt))
-    eval_steps_per_env = num_episodes * max_steps // env.cfg.env.num_envs + 1
+    # Resume check: skip if result already exists
+    if os.path.exists(result_file):
+        print(f"    [resume] Found cached result at {result_file}")
+        with open(result_file) as f:
+            d = json.load(f)
+        return np.array(d["xi"]), d["fitness"]
 
-    obs = env.get_observations()
-    privileged_obs = env.get_privileged_observations()
-    critic_obs = privileged_obs if privileged_obs is not None else obs
+    cmd = [
+        sys.executable, FINETUNE_WORKER_SCRIPT,
+        f"--xi={xi_str}",
+        "--resume_path", checkpoint_path,
+        "--finetune_steps", str(args.finetune_steps),
+        "--eval_episodes", str(args.eval_episodes),
+        "--tag", tag,
+        "--out", result_file,
+        "--device", args.device,
+        "--task_type", args.task_type,
+    ]
+    if args.num_envs is not None:
+        cmd.extend(["--num_envs", str(args.num_envs)])
+    if getattr(args, 'rows', None) is not None:
+        cmd.extend(["--rows", str(args.rows)])
+    if getattr(args, 'cols', None) is not None:
+        cmd.extend(["--cols", str(args.cols)])
+    # Pass --headless unless debug mode (where we want the viewer)
+    if not args.debug:
+        cmd.append("--headless")
+    # Pass debug/wandb flags to worker
+    if args.debug:
+        cmd.append("--debug")
+    if args.no_wandb:
+        cmd.append("--no_wandb")
 
-    for _ in range(eval_steps_per_env):
-        with torch.no_grad():
-            actions = runner.alg.actor_critic.act_inference(obs, hist_encoding=False)
-        obs, privileged_obs, rewards, dones, infos = env.step(actions)
-        total_reward += rewards.sum().item()
-        total_steps += 1
+    # Set LD_LIBRARY_PATH so subprocess finds libpython3.8.so
+    env = os.environ.copy()
+    conda_lib = os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "lib")
+    env["LD_LIBRARY_PATH"] = f"{conda_lib}:{env.get('LD_LIBRARY_PATH', '')}"
 
-    runner.alg.actor_critic.train()
-    return total_reward / (env.num_envs * num_episodes)
+    timeout_seconds = max(3600, args.finetune_steps * 10)
+    subprocess.run(cmd, check=True, timeout=timeout_seconds, env=env)
+
+    with open(result_file) as f:
+        d = json.load(f)
+    return np.array(d["xi"]), d["fitness"]
 
 
 def run_finetune():
     """Main fine-tuning + BO loop."""
     args = get_finetune_args()
 
-    # ---- 1. Load pre-trained checkpoint ----
-    pretrain_log_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", args.proj_name)
-    resume_path = get_load_path(
-        pretrain_log_root,
-        load_run=args.resumeid,
-        checkpoint=args.checkpoint,
-    )
-    print(f"Loading pre-trained model from: {resume_path}")
-    pretrain_state = torch.load(resume_path, map_location=args.device)
-
-    # ---- 2. Create base configs ----
-    env_cfg = CoDesignCfg()
-    train_cfg = CoDesignCfgPPO()
-
-    # Fine-tuning: disable spatial randomization, use standard gamma
-    env_cfg.spatial_rand.enable = False
-    train_cfg.algorithm.gamma = 0.99
-    train_cfg.runner.algorithm_class_name = 'PPO'  # Standard PPO for fine-tuning
-    train_cfg.runner.experiment_name = 'codesign_finetune'
-    train_cfg.runner.max_iterations = args.finetune_steps + 1
-
-    if args.num_envs is not None:
-        env_cfg.env.num_envs = args.num_envs
-    elif args.debug:
-        env_cfg.env.num_envs = 64
-        env_cfg.terrain.num_rows = 5
-        env_cfg.terrain.num_cols = 8
-        args.headless = False
+    # Debug mode: smaller env, disable wandb, show viewer (same pattern as pretrain)
+    if args.debug:
+        if args.num_envs is None:
+            args.num_envs = 64
         args.no_wandb = True
-        print("[DEBUG] 64 envs, 5x8 terrain, headless=False, no_wandb=True")
+        args.headless = False
+        args.rows = 5
+        args.cols = 8
+        print(f"[DEBUG] num_envs={args.num_envs}, rows=5, cols=8, headless=False, no_wandb=True")
+
+    # ---- 1. Resolve pre-trained checkpoint path ----
+    pretrain_log_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs",
+                                     args.proj_name, args.resumeid)
+    resume_path = get_load_path(pretrain_log_root, checkpoint=args.checkpoint)
+    print(f"Pre-trained checkpoint: {resume_path}")
+
+    # ---- 2. Create log directory (fixes Issue 1) ----
+    log_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", args.proj_name, args.exptid)
+    os.makedirs(log_root, exist_ok=True)
 
     # ---- 3. Set up BO ----
-    # Parameter bounds: [front_thigh, front_calf, rear_thigh, rear_calf]
     xi_bounds = [(0.6, 1.4), (0.6, 1.4), (0.6, 1.4), (0.6, 1.4)]
     bo = BayesianOptimizer(
         bounds=xi_bounds,
-        n_init=args.n_init,
-        n_iter=args.n_iter,
+        n_init=args.n_init if not args.debug else 3,
+        n_iter=args.n_iter if not args.debug else 2,
         length_scale=0.3,
         noise=1e-3,
         seed=42,
@@ -169,15 +178,15 @@ def run_finetune():
     print(f"Task type: {args.task_type}")
     print(f"{'='*60}\n")
 
-    # Wandb 初始化（project 使用 args.proj_name 软编码）
+    # ---- 4. Wandb init ----
     import wandb
-    if args.no_wandb:
+    if args.no_wandb or args.debug:
         wandb_mode = "disabled"
     else:
         wandb_mode = "online"
     wandb.init(project=args.proj_name, name=args.exptid,
                entity="jackchen1349-shenzhen", group=args.exptid[:3],
-               mode=wandb_mode, config={
+               mode=wandb_mode, dir="../../logs", config={
                    "xi_bounds": xi_bounds,
                    "n_init": args.n_init, "n_iter": args.n_iter,
                    "finetune_steps": args.finetune_steps,
@@ -194,94 +203,52 @@ def run_finetune():
             print(f"\n--- BO iteration {bo_iter + 1}/{bo.n_total} ---")
             print(f"    Candidate xi: [{xi[0]:.4f}, {xi[1]:.4f}, {xi[2]:.4f}, {xi[3]:.4f}]")
 
-            # ---- 4. Create environment with fixed xi ----
-            env_cfg_fresh = deepcopy(env_cfg)
-            train_cfg_fresh = deepcopy(train_cfg)
+            t0 = time.time()
+            try:
+                _, fitness = evaluate_candidate(xi, resume_path, args, bo_iter)
+            except subprocess.TimeoutExpired:
+                print(f"    Worker timed out, assigning low fitness")
+                fitness = -1000.0
+            except subprocess.CalledProcessError as e:
+                print(f"    Worker failed (exit code {e.returncode}), assigning low fitness")
+                fitness = -1000.0
 
-            # Override xi sampling to use fixed values
-            env_cfg_fresh.spatial_rand.enable = False
-
-            # Register and create env (task name from args, soft-coded)
-            finetune_task_name = args.task + "_finetune"
-            task_registry.register(finetune_task_name, CoDesignLeggedRobot,
-                                   env_cfg_fresh, train_cfg_fresh)
-            env, _ = task_registry.make_env(
-                name=finetune_task_name,
-                args=args,
-                env_cfg=env_cfg_fresh,
-            )
-            env._xi_values[:] = torch.tensor(xi, dtype=torch.float, device=env.device)
-
-            # Recompute PD gains for this xi
-            pd_coeffs = env_cfg_fresh.spatial_rand.pd_correction_coeffs
-            from legged_gym.envs.codesign.urdf_utils import compute_pd_correction
-            for j in range(env.num_dofs):
-                name = env.dof_names[j]
-                leg_prefix = name[:2]
-                if "calf" in name:
-                    xi_idx = {"FR": 1, "FL": 1, "RR": 3, "RL": 3}.get(leg_prefix, 0)
-                else:
-                    xi_idx = {"FR": 0, "FL": 0, "RR": 2, "RL": 2}.get(leg_prefix, 0)
-                eta = compute_pd_correction(xi[xi_idx], pd_coeffs)
-                env.p_gains_env[:, j] = eta * env.p_gains[j]
-                env.d_gains_env[:, j] = eta * env.d_gains[j]
-
-            # ---- 5. Create runner and load pre-trained weights ----
-            runner, train_cfg_runner = task_registry.make_alg_runner(
-                env=env,
-                name=finetune_task_name,
-                args=args,
-                train_cfg=train_cfg_fresh,
-                init_wandb=False,
-            )
-            runner.alg.actor_critic.load_state_dict(pretrain_state['model_state_dict'])
-            runner.alg.estimator.load_state_dict(pretrain_state['estimator_state_dict'])
-
-            # ---- 6. Fine-tune ----
-            print(f"    Fine-tuning for {args.finetune_steps} steps...")
-            runner.learn(num_learning_iterations=args.finetune_steps)
-
-            # ---- 7. Evaluate fitness ----
-            fitness = evaluate_fitness(env, runner, num_episodes=args.eval_episodes)
-            print(f"    Fitness: {fitness:.4f}")
-
+            elapsed = time.time() - t0
             bo.update(xi, float(fitness))
+            print(f"    Fitness: {fitness:.4f}  [{elapsed:.0f}s]")
 
             if fitness > best_fitness_so_far:
                 best_fitness_so_far = fitness
                 best_xi_so_far = xi.copy()
-                # Save best model
-                best_path = os.path.join(
-                    LEGGED_GYM_ROOT_DIR, "logs", args.proj_name,
-                    f"{args.exptid}_best_model_{bo_iter}.pt"
-                )
-                os.makedirs(os.path.dirname(best_path), exist_ok=True)
-                torch.save({
-                    'model_state_dict': runner.alg.actor_critic.state_dict(),
-                    'estimator_state_dict': runner.alg.estimator.state_dict(),
-                    'xi': xi,
-                    'fitness': fitness,
-                }, best_path)
+                # Save best result metadata
+                best_info = {
+                    "xi": xi.tolist(),
+                    "fitness": float(fitness),
+                    "bo_iter": bo_iter,
+                    "task_type": args.task_type,
+                }
+                best_path = os.path.join(log_root, f"best_{bo_iter:03d}.json")
+                with open(best_path, "w") as f:
+                    json.dump(best_info, f)
+                print(f"    -> New best! xi={best_xi_so_far}, fitness={best_fitness_so_far:.4f}")
 
-                print(f"    Best so far: xi={best_xi_so_far}, fitness={best_fitness_so_far:.4f}")
-
-            wandb.log({"bo_iter": bo_iter,
-                       "xi_0": xi[0], "xi_1": xi[1], "xi_2": xi[2], "xi_3": xi[3],
-                       "fitness": float(fitness),
-                       "best_fitness": best_fitness_so_far}, step=bo_iter)
-
-            # Cleanup env to free GPU memory
-            del env, runner
+            wandb.log({
+                "bo_iter": bo_iter,
+                "xi_0": xi[0], "xi_1": xi[1], "xi_2": xi[2], "xi_3": xi[3],
+                "fitness": float(fitness),
+                "best_fitness": best_fitness_so_far,
+            }, step=bo_iter)
 
         except Exception as e:
             print(f"    BO iteration {bo_iter} failed: {e}")
             import traceback
             traceback.print_exc()
 
-    # ---- 8. Report results ----
+    # ---- 5. Report results ----
     print(f"\n{'='*60}")
     print(f"OPTIMIZATION COMPLETE")
     print(f"{'='*60}")
+    print(f"Task type: {args.task_type}")
     print(f"Best xi: {best_xi_so_far}")
     print(f"Best fitness: {best_fitness_so_far:.4f}")
     print(f"All history:")
@@ -289,15 +256,21 @@ def run_finetune():
     for i in range(len(y_hist)):
         print(f"  [{i}] xi={X_hist[i].round(4)}, fitness={y_hist[i]:.4f}")
 
-    # 上传最佳模型到 wandb
-    import glob
-    best_model_dir = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", args.proj_name)
-    best_model_pattern = f"{args.exptid}_best_model_*.pt"
-    best_files = glob.glob(os.path.join(best_model_dir, best_model_pattern))
-    if best_files:
-        latest = max(best_files, key=os.path.getmtime)
-        wandb.save(latest, policy="now")
-        print(f"已上传最佳模型到 wandb: {os.path.basename(latest)}")
+    # Save final results
+    final_output = {
+        "task_type": args.task_type,
+        "best_xi": best_xi_so_far.tolist() if best_xi_so_far is not None else None,
+        "best_fitness": float(best_fitness_so_far),
+        "history": [
+            {"xi": X_hist[i].tolist(), "fitness": float(y_hist[i])}
+            for i in range(len(y_hist))
+        ],
+    }
+    final_path = os.path.join(log_root, "final_results.json")
+    with open(final_path, "w") as f:
+        json.dump(final_output, f, indent=2)
+    print(f"\nResults saved to {log_root}")
+
     wandb.finish()
 
 
