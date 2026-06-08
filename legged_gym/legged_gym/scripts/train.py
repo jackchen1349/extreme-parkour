@@ -35,6 +35,7 @@ from datetime import datetime
 import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry
+from legged_gym.utils.helpers import class_to_dict
 from shutil import copyfile
 import torch
 import wandb
@@ -48,6 +49,7 @@ def train(args):
         pass
     if args.debug:
         mode = "disabled"
+        args.headless = False
         args.rows = 10
         args.cols = 8
         args.num_envs = 64

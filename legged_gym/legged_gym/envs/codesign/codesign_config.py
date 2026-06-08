@@ -15,10 +15,10 @@ class CoDesignCfg(LeggedRobotCfg):
     # are computed automatically from n_proprio, n_scan, etc.
     # Override n_priv_latent to include structure parameters (xi values).
     class env(LeggedRobotCfg.env):
-        # Override: include real body masses (6) + COM (15) + friction(1) + motor(24) + xi(4)
-        n_priv_latent = 50  # mass(6) + COM(15) + friction(1) + Kp(12) + Kd(12) + xi(4) = 50
-        # Recompute total: 53(proprio) + 132(scan) + 530(history) + 50(latent) + 9(explicit)
-        num_observations = 774
+        # trunk mass offset(1) + leg masses(4) + COM(15) + friction(1) + motor(24) + xi(4)
+        n_priv_latent = 49  # mass(5) + COM(15) + friction(1) + Kp(12) + Kd(12) + xi(4) = 49
+        # Recompute total: 53(proprio) + 132(scan) + 530(history) + 49(latent) + 9(explicit)
+        num_observations = 773
 
     class asset(LeggedRobotCfg.asset):
         file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/parkour_quadruped/urdf/parkour_quadruped_a1_style_v3.urdf'
@@ -82,9 +82,9 @@ class CoDesignCfg(LeggedRobotCfg):
     # Trunk: uses original added_mass_range [0, 3] kg & added_com_range [-0.2, 0.2] m (additive)
     # Hip/Thigh/Calf: independent multiplicative mass & additive COM perturbation
     class domain_rand(LeggedRobotCfg.domain_rand):
-        randomize_body_mass = True
-        leg_mass_range = [0.85, 1.15]   # multiplicative factor for hip/thigh/calf
-        randomize_body_com = True
+        randomize_body_mass = False
+        leg_mass_range = [0.95, 1.05]   # multiplicative factor for hip/thigh/calf
+        randomize_body_com = False
         leg_com_range = [-0.01, 0.01]   # additive offset (m) for hip/thigh/calf COM
 
 

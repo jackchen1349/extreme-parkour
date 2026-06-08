@@ -63,6 +63,7 @@ python anchor_search.py --exptid ANCHOR-001 --debug --device cuda:0  # 2+3 per a
 # === Coefficient Comparison ===
 python _compare_worker.py --tag BASELINE --out /tmp/baseline.json --device cuda:0
 python _compare_worker.py --tag ANCHOR --out /tmp/anchor.json --use_separate --device cuda:0
+python compare_coeffs.py --device cuda:0  # Compare anchor-derived coefficients vs BO baseline (500 iters)
 
 # === Export ===
 python save_jit.py --exptid 001-00
@@ -98,14 +99,14 @@ python fetch.py  # SSH-based log/model fetching
 
 | Class | Inherits From | Purpose |
 |-------|--------------|---------|
-| `CoDesignCfg` | `LeggedRobotCfg` | URDF path (v3), `spatial_rand` config, `n_priv_latent=50`, `damping=1.0`, front/rear-separated `pd_correction_coeffs` |
+| `CoDesignCfg` | `LeggedRobotCfg` | URDF path (v3), `spatial_rand` config, `n_priv_latent=49`, `damping=1.0`, front/rear-separated `pd_correction_coeffs` |
 | `CoDesignCfgPPO` | `LeggedRobotCfgPPO` | `gamma=0.98`, `gamma_reg=0.98`, `algorithm_class_name='CoDesignPPO'` |
 | `CoDesignLeggedRobot` | `LeggedRobot` | Multi-URDF env creation; per-env PD gains (Eq 1-2) for HipY+Knee only (HipX excluded); xi in privileged observations |
 | `CoDesignPPO` | `PPO` | Overrides `compute_returns` to use `gamma_reg=0.98` for GAE (paper Eq 3-4) |
 
 Supporting files:
 - `urdf_utils.py` — URDF geometry/mass/inertia/origin scaling per paper Table 2; `URDFCache`; `compute_pd_correction` (Eq 1)
-- `bayesian_optimizer.py` — Self-contained GP (Matérn 2.5 kernel) + EI acquisition for black-box optimization
+- `bayesian_optimizer.py` — Self-contained GP (Matérn 2.5 kernel) + EI acquisition for black-box optimization (in `utils/`)
 - `codesign_optimize_pd.py` + `_pd_optimize_worker.py` — BO-based PD coefficient search over [a,b,c,d]
 - `anchor_search.py` + `_anchor_worker.py` — Anchor-point 2D BO search with front/rear separation
 - `_compare_worker.py` — Single-coefficient-set evaluator (full spatial rand, 500 iters)
@@ -114,9 +115,11 @@ Supporting files:
 **Body mass/COM extraction** (in `codesign_robot.py` `_create_envs`):
 - Builds `_body_idx` name→index map from Isaac Gym `get_asset_rigid_body_names`
 - Reads raw masses/COM from `body_props` before parent's `_process_rigid_body_props`
-- Applies domain randomization separately: trunk via parent's additive rand, legs via multiplicative mass + additive COM
-- Stores perturbed values in `body_mass_tensor` (6 dims) and `body_com_tensor` (15 dims)
+- Applies domain randomization separately: trunk → parent's additive rand, legs → multiplicative mass + additive COM
+- Stores in `body_mass_tensor` (5 dims): trunk uses `mass_params[0]` (offset), legs use perturbed actual values
+- Stores in `body_com_tensor` (15 dims): trunk uses `mass_params[1:4]` (COM offset), legs use perturbed actual values
 - Helper: `_average_body_com(props, indices)` averages COM across left/right body indices
+- Hip mass is NOT stored separately (only thigh_f, thigh_r, calf_f, calf_r leg masses)
 
 ### PD Coefficient Optimization Pipeline
 
@@ -142,18 +145,18 @@ Three approaches exist for finding optimal PD correction coefficients:
 ### Observation Space (Co-Design)
 
 ```
-[proprio(53) | scandots(132) | priv_explicit(9) | priv_latent(50) | history(530)] = 774
+[proprio(53) | scandots(132) | priv_explicit(9) | priv_latent(49) | history(530)] = 773
 ```
 
-Privileged latent (50 dims) — **real body physics parameters** with domain randomization:
+Privileged latent (49 dims) — **body physics parameters** with domain randomization:
 
 ```
-body_mass(6):      [Trunk | Hip | Thigh_front | Thigh_rear | Calf_front | Calf_rear]
-body_COM(15):      [Trunk_xyz | Thigh_front_xyz | Thigh_rear_xyz | Calf_front_xyz | Calf_rear_xyz]
-friction(1) | Kp(12) | Kd(12) | xi(4) = 50
+body_mass(5):      [Trunk_offset | Thigh_front | Thigh_rear | Calf_front | Calf_rear]
+body_COM(15):      [Trunk_COM_offset | Thigh_front_xyz | Thigh_rear_xyz | Calf_front_xyz | Calf_rear_xyz]
+friction(1) | Kp(12) | Kd(12) | xi(4) = 49
 ```
 
-**Grouping**: left-right symmetric (FR=FL, RR=RL). Front/rear separated. Mass values are multiplicative-perturbed (±15%); COM values are additive-perturbed (±1cm). Trunk uses the parent-class additive randomization (`added_mass_range [0,3] kg`, `added_com_range [-0.2,0.2] m`).
+**Grouping**: left-right symmetric (FR=FL, RR=RL). Front/rear separated. Trunk mass/COM uses the **offset** from domain randomization (`mass_params = [rand_mass, rand_com_x, rand_com_y, rand_com_z]`), not the post-randomization actual value — matching the parent class `LeggedRobot` behavior. Leg masses are multiplicative-perturbed (±5%); leg COM values are additive-perturbed (±1cm). Hip mass is not included in priv_latent.
 
 The 4 xi values: `[ξ_front_thigh, ξ_front_calf, ξ_rear_thigh, ξ_rear_calf]`.
 
@@ -201,8 +204,9 @@ PD parameters: `kp=40`, `kd=1.0`. Per-env gains: `kp_i = η(ξᵢ) × 40`, `kd_i
 - Rear (RR/RL): `[4.6244, -13.8671, 14.0724, -3.8996]`
 
 **Body mass/COM domain randomization** (configured in `domain_rand`):
-- Trunk: additive mass `added_mass_range [0, 3] kg`, additive COM `added_com_range [-0.2, 0.2] m` (inherited from parent)
-- Hip/Thigh/Calf: multiplicative mass `leg_mass_range [0.85, 1.15]`, additive COM `leg_com_range [-0.01, 0.01] m`
+- Trunk: additive mass `added_mass_range [0, 3] kg`, additive COM `added_com_range [-0.2, 0.2] m` (inherited from parent). Only the **offset** is stored in priv_latent.
+- Legs (Thigh/Calf): multiplicative mass `leg_mass_range [0.95, 1.05]`, additive COM `leg_com_range [-0.01, 0.01] m`. Actual perturbed values stored in priv_latent.
+- Hip mass is randomized in simulation but NOT included in priv_latent.
 
 ## Gotchas
 
@@ -218,7 +222,7 @@ PD parameters: `kp=40`, `kd=1.0`. Per-env gains: `kp_i = η(ξᵢ) × 40`, `kd_i
 - **`OnPolicyRunner` final model** saved with `tot_iter` naming (e.g., `model_50000.pt`), not `current_learning_iteration`.
 - **Isaac Gym merges links connected by fixed joints**. The trunk, camera_box, imu_link are merged into a single rigid body named `"base"`. Use `body_props[body_idx["base"]]` to access trunk mass/COM, not `"trunk"`. Only 17 rigid bodies exist (not 24 as in the URDF).
 - **`friction_coeffs_tensor` is 1D** `(num_envs,)` — unsqueeze to `(num_envs, 1)` before concatenating into priv_latent.
-- **`body_mass_tensor` and `body_com_tensor`** store domain-randomized values (post-perturbation), matching the actual simulation state. Read raw values from `body_props` *before* `_process_rigid_body_props` to avoid double-randomization with the parent class.
+- **`body_mass_tensor` and `body_com_tensor`**: Trunk entries store the domain-randomization **offset** (`mass_params[0]` and `mass_params[1:4]`), NOT the post-randomization actual values. Leg entries store perturbed actual values. `body_mass_tensor` is 5 dims (no hip). Read raw values from `body_props` *before* `_process_rigid_body_props` to avoid double-randomization with the parent class.
 - **Circular import**: `legged_gym.utils.__init__` → `task_registry` → `legged_gym.envs.base.legged_robot_config` → `legged_gym.envs.__init__` → `task_registry`. Fix by importing from `legged_gym.envs` BEFORE `legged_gym.utils.helpers`.
 - **`wandb.init()` required before `runner.learn()`**: `OnPolicyRunner.learn()` calls `wandb.log()` unconditionally. Worker scripts must call `wandb.init()` first (use `mode="disabled"` if no logging needed). The `init_wandb` parameter in `OnPolicyRunner.__init__` is a **dead parameter** — accepted but never used.
 - **`torch.inference_mode()` for eval after `runner.learn()`**: PPO rollout uses `torch.inference_mode()`, tainting env buffer tensors. Post-training evaluation MUST also use `torch.inference_mode()` when calling `env.step()` or in-place ops on `obs_history_buf`/`contact_buf` will crash with "Inplace update to inference tensor outside InferenceMode".

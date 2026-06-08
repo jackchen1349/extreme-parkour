@@ -217,7 +217,7 @@ class CoDesignLeggedRobot(LeggedRobot):
         self.cam_tensors = []
         self.mass_params_tensor = torch.zeros(self.num_envs, 4, dtype=torch.float,
                                                device=self.device, requires_grad=False)
-        self.body_mass_tensor = torch.zeros(self.num_envs, 6, dtype=torch.float,
+        self.body_mass_tensor = torch.zeros(self.num_envs, 5, dtype=torch.float,
                                              device=self.device, requires_grad=False)
         self.body_com_tensor = torch.zeros(self.num_envs, 15, dtype=torch.float,
                                             device=self.device, requires_grad=False)
@@ -330,15 +330,14 @@ class CoDesignLeggedRobot(LeggedRobot):
 
             # Assemble tensors: trunk uses post-parent-rand, legs use perturbed values
             body_mass_arr = np.array([
-                trunk_mass_post,
-                raw_hip_mass * leg_mass_factor[0],
+                mass_params[0],                       # trunk mass offset
                 raw_thigh_mass_f * leg_mass_factor[1],
                 raw_thigh_mass_r * leg_mass_factor[2],
                 raw_calf_mass_f * leg_mass_factor[3],
                 raw_calf_mass_r * leg_mass_factor[4],
             ])
             body_com_arr = np.array(
-                trunk_com_post +
+                list(mass_params[1:4]) +              # trunk COM offset
                 [raw_thigh_com_f[0] + leg_com_offset[0],
                  raw_thigh_com_f[1] + leg_com_offset[1],
                  raw_thigh_com_f[2] + leg_com_offset[2]] +
@@ -562,13 +561,13 @@ class CoDesignLeggedRobot(LeggedRobot):
         if friction_2d.dim() > 2:
             friction_2d = friction_2d.reshape(self.num_envs, -1)
         priv_latent = torch.cat((
-            self.body_mass_tensor.reshape(self.num_envs, -1),          # 6
-            self.body_com_tensor.reshape(self.num_envs, -1),           # 15
+            self.body_mass_tensor.reshape(self.num_envs, -1),          # 5  (trunk offset + leg masses)
+            self.body_com_tensor.reshape(self.num_envs, -1),           # 15 (trunk COM offset + leg COMs)
             friction_2d,                                                # 1
             (self.motor_strength[0] - 1).reshape(self.num_envs, -1),   # 12
             (self.motor_strength[1] - 1).reshape(self.num_envs, -1),   # 12
             self._xi_values.reshape(self.num_envs, -1),                # 4
-        ), dim=-1)  # total: 6+15+1+12+12+4 = 50
+        ), dim=-1)  # total: 5+15+1+12+12+4 = 49
         if self.cfg.terrain.measure_heights:
             heights = torch.clip(
                 self.root_states[:, 2].unsqueeze(1) - 0.3 - self.measured_heights, -1, 1.)
