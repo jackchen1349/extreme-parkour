@@ -53,7 +53,7 @@ def get_finetune_args():
          "help": "BO initial random samples"},
         {"name": "--n_iter", "type": int, "default": 15,
          "help": "BO optimization iterations"},
-        {"name": "--finetune_steps", "type": int, "default": 400,
+        {"name": "--finetune_steps", "type": int, "default": 800,
          "help": "Fine-tuning steps per BO iteration"},
         {"name": "--eval_episodes", "type": int, "default": 2,
          "help": "Evaluation episodes for fitness"},
@@ -64,6 +64,7 @@ def get_finetune_args():
     args = get_args(extra_parameters=finetune_params)
     if args.task == "a1":  # override get_args default for finetune
         args.task = "codesign"
+    args.proj_name = "codesign_finetune"
     return args
 
 
@@ -152,7 +153,7 @@ def run_finetune():
 
     # ---- 1. Resolve pre-trained checkpoint path ----
     pretrain_log_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs",
-                                     args.proj_name, args.resumeid)
+                                     "parkour_new", args.resumeid)
     resume_path = get_load_path(pretrain_log_root, checkpoint=args.checkpoint)
     print(f"Pre-trained checkpoint: {resume_path}")
 
