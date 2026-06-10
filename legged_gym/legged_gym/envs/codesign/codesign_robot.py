@@ -21,6 +21,12 @@ from legged_gym.envs.codesign.urdf_utils import (
     THIGH_XI_IDX,
     CALF_XI_IDX,
 )
+from legged_gym.envs.codesign.inertia_utils import (
+    THIGH_NOMINAL, CALF_NOMINAL,
+    FOOT_MASS, FOOT_I_YY,
+    THIGH_COM_X, CALF_COM_X,
+    DEFAULT_Q_CALF, KP0, KD0,
+)
 from legged_gym.utils.helpers import class_to_dict
 import copy
 from tqdm import tqdm
@@ -417,6 +423,82 @@ class CoDesignLeggedRobot(LeggedRobot):
         z = np.mean([props[i].com.z for i in indices])
         return [x, y, z]
 
+    @staticmethod
+    def _batched_calf_eff_inertia(xi_calf: torch.Tensor) -> torch.Tensor:
+        """Vectorized calf joint effective inertia (foot NOT scaled — fixed geometry).
+
+        Args:
+            xi_calf: (N,) tensor of calf xi values.
+
+        Returns:
+            I_eff: (N,) tensor of effective inertia [kg·m²] about the calf Y axis.
+        """
+        # Calf link — scales with xi_calf
+        cm = CALF_NOMINAL["mass"] * xi_calf
+        cI = CALF_NOMINAL["inertia_iyy"] * xi_calf
+        cdx = torch.tensor(CALF_COM_X, device=xi_calf.device)
+        cdz = CALF_NOMINAL["inertial_origin_z"] * xi_calf
+        # Foot — CONSTANT (not scaled in URDF)
+        fm = FOOT_MASS
+        fI = FOOT_I_YY
+        fjz = CALF_NOMINAL["foot_joint_origin_z"] * xi_calf  # joint at end of scaled calf
+
+        I_calf = cI + cm * (cdx ** 2 + cdz ** 2)
+        I_foot = fI + fm * (fjz ** 2)  # foot COM at joint origin (dx=0)
+        return I_calf + I_foot
+
+    @staticmethod
+    def _batched_thigh_eff_inertia(xi_thigh: torch.Tensor, xi_calf: torch.Tensor,
+                                    q_calf: float = DEFAULT_Q_CALF) -> torch.Tensor:
+        """Vectorized thigh (HipY) joint effective inertia.
+
+        The serial chain is: thigh → calf(q_calf) → foot.  Link masses and
+        inertias scale with their respective xi; the foot mass/inertia are
+        constant (not scaled in URDF).
+
+        Args:
+            xi_thigh: (N,) tensor of thigh xi values.
+            xi_calf:  (N,) tensor of calf xi values (downstream chain).
+            q_calf:   Knee joint angle [rad] (default -1.5).
+
+        Returns:
+            I_eff: (N,) tensor of effective inertia [kg·m²] about the thigh Y axis.
+        """
+        # ---- Thigh link (scales with xi_thigh) ----
+        tm = THIGH_NOMINAL["mass"] * xi_thigh
+        tI = THIGH_NOMINAL["inertia_iyy"] * xi_thigh
+        tdx = torch.tensor(THIGH_COM_X, device=xi_thigh.device)
+        tdz = THIGH_NOMINAL["inertial_origin_z"] * xi_thigh
+        cjz = THIGH_NOMINAL["calf_joint_origin_z"] * xi_thigh
+
+        # ---- Calf link (scales with xi_calf) ----
+        cm = CALF_NOMINAL["mass"] * xi_calf
+        cI = CALF_NOMINAL["inertia_iyy"] * xi_calf
+        cdx = torch.tensor(CALF_COM_X, device=xi_calf.device)
+        cdz = CALF_NOMINAL["inertial_origin_z"] * xi_calf
+
+        # ---- Foot (CONSTANT) ----
+        fm = FOOT_MASS
+        fI = FOOT_I_YY
+        fjz = CALF_NOMINAL["foot_joint_origin_z"] * xi_calf
+
+        # Thigh contribution
+        I_thigh = tI + tm * (tdx ** 2 + tdz ** 2)
+
+        # Calf contribution — rotate calf COM into thigh frame, then translate
+        q = torch.tensor(q_calf, device=xi_thigh.device)
+        c, s = torch.cos(q), torch.sin(q)
+        cx_rot = c * cdx + s * cdz
+        cz_rot = -s * cdx + c * cdz
+        I_calf = cI + cm * (cx_rot ** 2 + (cjz + cz_rot) ** 2)
+
+        # Foot contribution — foot joint rotated into thigh frame
+        fx_rot = s * fjz
+        fz_rot = c * fjz
+        I_foot = fI + fm * (fx_rot ** 2 + (cjz + fz_rot) ** 2)
+
+        return I_thigh + I_calf + I_foot
+
     # ------------------------------------------------------------------
     # PD gains with per-environment correction (Eq 1-2)
     # ------------------------------------------------------------------
@@ -488,9 +570,31 @@ class CoDesignLeggedRobot(LeggedRobot):
             self.p_gains_env[:, i] = eta * self.p_gains[i]
             self.d_gains_env[:, i] = eta * self.d_gains[i]
 
-    # ------------------------------------------------------------------
-    # Torque computation with per-environment PD gains (Eq 9-11)
-    # ------------------------------------------------------------------
+        # ---- Per-joint effective inertia for 8 PD-corrected joints ----
+        # Only thigh and calf joints need explicit I_eff (varies with xi).
+        # Hip joints: I_eff is constant → cancels out in zeta/zeta_0.
+        xi = self._xi_values  # (N, 4): [front_thigh, front_calf, rear_thigh, rear_calf]
+        I_fc = self._batched_calf_eff_inertia(xi[:, 1])   # front calf
+        I_rc = self._batched_calf_eff_inertia(xi[:, 3])   # rear calf
+        I_ft = self._batched_thigh_eff_inertia(xi[:, 0], xi[:, 1])  # front thigh
+        I_rt = self._batched_thigh_eff_inertia(xi[:, 2], xi[:, 3])  # rear thigh
+
+        # Stack: [FR_th, FL_th, RR_th, RL_th, FR_ca, FL_ca, RR_ca, RL_ca]
+        self._I_eff = torch.stack([
+            I_ft, I_ft, I_rt, I_rt,
+            I_fc, I_fc, I_rc, I_rc,
+        ], dim=1)  # (N, 8)
+
+        # Baseline zeta_0 for thigh and calf (xi=1.0, nominal gains)
+        _ones = torch.ones(1, device=self.device)
+        I_0_t = self._batched_thigh_eff_inertia(_ones, _ones)
+        I_0_c = self._batched_calf_eff_inertia(_ones)
+        z0_t = KD0 / (2.0 * torch.sqrt(KP0 * I_0_t))  # ~0.525
+        z0_c = KD0 / (2.0 * torch.sqrt(KP0 * I_0_c))  # ~0.922
+        # (8,): [thigh×4, calf×4]
+        self._zeta_0_pd = torch.tensor(
+            [z0_t.item()] * 4 + [z0_c.item()] * 4,
+            device=self.device)
 
     def _compute_torques(self, actions):
         """Override to use per-environment PD gains.
@@ -528,8 +632,8 @@ class CoDesignLeggedRobot(LeggedRobot):
     def compute_observations(self):
         """Override to include leg-length scaling factors xi in priv_latent.
 
-        Paper specification:
-          et = [mass(1), COM(3), structure_params(4), friction(1), motor_damping(24)] = 33
+        Paper specification (adapted):
+          et = [body_mass(5), body_com(15), friction(1), damping_ratio(12), xi(4)] = 37
         """
         imu_obs = torch.stack((self.roll, self.pitch), dim=1)
         if self.global_counter % 5 == 0:
@@ -560,14 +664,37 @@ class CoDesignLeggedRobot(LeggedRobot):
         friction_2d = self.friction_coeffs_tensor.unsqueeze(-1)  # (N, 1)
         if friction_2d.dim() > 2:
             friction_2d = friction_2d.reshape(self.num_envs, -1)
+
+        # ---- Per-joint normalized damping ratio (replaces raw motor_strength) ----
+        ms_kp = self.motor_strength[0]  # (N, 12)
+        ms_kd = self.motor_strength[1]  # (N, 12)
+
+        # Hip joints (4 DOFs): constant PD gains + constant I_eff → simplified
+        #   zeta/zeta_0 = ms_kd / sqrt(ms_kp)
+        zeta_hip = ms_kd[:, self.hip_indices] / torch.sqrt(
+            ms_kp[:, self.hip_indices] + 1e-10)  # (N, 4)
+
+        # Thigh + Calf joints (8 DOFs): PD-corrected, I_eff varies with xi
+        pd_idx = torch.cat([self.thigh_indices, self.calf_indices])  # (8,)
+        Kp_actual = ms_kp[:, pd_idx] * self.p_gains_env[:, pd_idx]
+        Kd_actual = ms_kd[:, pd_idx] * self.d_gains_env[:, pd_idx]
+        zeta_pd = Kd_actual / (2.0 * torch.sqrt(Kp_actual * self._I_eff + 1e-10))
+        zeta_ratio_pd = zeta_pd / self._zeta_0_pd.unsqueeze(0)  # (N, 8)
+
+        # Assemble in DOF order (0..11)
+        damping_ratio = torch.zeros(self.num_envs, self.num_dof,
+                                     dtype=torch.float, device=self.device)
+        damping_ratio[:, self.hip_indices] = zeta_hip
+        damping_ratio[:, self.thigh_indices] = zeta_ratio_pd[:, :4]
+        damping_ratio[:, self.calf_indices] = zeta_ratio_pd[:, 4:]
+
         priv_latent = torch.cat((
-            self.body_mass_tensor.reshape(self.num_envs, -1),          # 5  (trunk offset + leg masses)
-            self.body_com_tensor.reshape(self.num_envs, -1),           # 15 (trunk COM offset + leg COMs)
-            friction_2d,                                                # 1
-            (self.motor_strength[0] - 1).reshape(self.num_envs, -1),   # 12
-            (self.motor_strength[1] - 1).reshape(self.num_envs, -1),   # 12
-            self._xi_values.reshape(self.num_envs, -1),                # 4
-        ), dim=-1)  # total: 5+15+1+12+12+4 = 49
+            self.body_mass_tensor.reshape(self.num_envs, -1),   # 5
+            self.body_com_tensor.reshape(self.num_envs, -1),    # 15
+            friction_2d,                                          # 1
+            damping_ratio,                                        # 12 (replaces 24 motor_strength)
+            self._xi_values.reshape(self.num_envs, -1),          # 4
+        ), dim=-1)  # total: 5+15+1+12+4 = 37
         if self.cfg.terrain.measure_heights:
             heights = torch.clip(
                 self.root_states[:, 2].unsqueeze(1) - 0.3 - self.measured_heights, -1, 1.)
